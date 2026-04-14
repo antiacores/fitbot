@@ -1,0 +1,5 @@
+venv/
+.env
+fitness_agent_logs.json
+__pycache__/
+*.pyc
