@@ -7,28 +7,36 @@ from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
 from datetime import datetime
 import json
 import os
+import requests
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
-# ─────────────────────────────────────────────
+# CHROMADB
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vectorstore = Chroma(
+    persist_directory="./chroma_db",
+    embedding_function=embeddings
+)
+
 # FASTAPI
-# ─────────────────────────────────────────────
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # origen de React
+    allow_origins=["http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────
 # MANEJO DE LOGS EN JSON
-# ─────────────────────────────────────────────
 
 LOGS_FILE = "fitness_agent_logs.json"
 
@@ -53,9 +61,23 @@ def guardar_log(role: str, content: str):
     with open(LOGS_FILE, "w", encoding="utf-8") as f:
         json.dump(logs, f, ensure_ascii=False, indent=2)
 
-# ─────────────────────────────────────────────
 # HERRAMIENTAS
-# ─────────────────────────────────────────────
+
+@tool
+def consultar_base_de_conocimiento(consulta: str) -> str:
+    """
+    Busca información en la base de conocimiento de FitBot sobre ejercicios,
+    nutrición, planes de dieta, lesiones y términos fitness.
+    Úsala para responder preguntas generales de fitness que no requieran cálculos.
+    """
+    try:
+        docs = vectorstore.similarity_search(consulta, k=3)
+        if not docs:
+            return "No encontré información relevante en la base de conocimiento."
+        resultados = "\n\n".join([doc.page_content for doc in docs])
+        return resultados
+    except Exception as e:
+        return f"Error al consultar la base de conocimiento: {e}"
 
 @tool
 def calcular_imc(peso_kg: float, altura_m: float) -> str:
@@ -162,30 +184,57 @@ def rutina_ejercicio(objetivo: str, dias_disponibles: int) -> str:
     except Exception as e:
         return f"Error al generar la rutina de ejercicio: {e}"
 
+
+@tool
+def consultar_ibero_fitness() -> str:
+    """
+    Obtiene información actualizada sobre las clases fitness, talleres deportivos
+    y gimnasio de la IBERO Puebla desde su sitio web oficial.
+    """
+    try:
+        url = "https://www.iberopuebla.mx/IBEROmas/fitness"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Eliminar scripts, estilos y nav
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+
+        # Extraer texto del contenido principal
+        main = soup.find("main") or soup.find("body")
+        texto = main.get_text(separator="\n", strip=True)
+
+        # Limpiar líneas vacías múltiples
+        lineas = [l for l in texto.splitlines() if l.strip()]
+        resultado = "\n".join(lineas[:80])  # primeras 80 líneas relevantes
+
+        return f"Información del fitness IBERO Puebla:\n\n{resultado}"
+    except Exception as e:
+        return f"Error al obtener información de la IBERO: {e}"
+
 tavily = TavilySearchResults(max_results=3)
 
-# ─────────────────────────────────────────────
 # AGENTE
-# ─────────────────────────────────────────────
 
 agent = create_agent(
     model=ChatGroq(model="llama-3.3-70b-versatile"),
-    tools=[calcular_imc, calcular_calorias, calcular_macros, rutina_ejercicio, tavily],
+    tools=[consultar_base_de_conocimiento, consultar_ibero_fitness, calcular_imc, calcular_calorias, calcular_macros, rutina_ejercicio, tavily],
     system_prompt="""
     Eres FitBot, un experto en fitness y salud.
     Usa:
-    - Tavily para búsqueda web de ejercicios, dietas y consejos actualizados.
+    - consultar_base_de_conocimiento para responder preguntas sobre ejercicios, nutrición, lesiones, planes de dieta y términos fitness.
     - calcular_imc para evaluar el estado corporal.
     - calcular_calorias para determinar necesidades energéticas.
     - calcular_macros para planificar dietas según objetivos.
     - rutina_ejercicio para generar rutinas según objetivos y disponibilidad semanal.
+    - consultar_ibero_fitness para obtener información actualizada sobre clases, talleres y gimnasio de la IBERO Puebla.
+    - Tavily para buscar noticias y consejos actualizados de fitness en internet.
     SIEMPRE usa las herramientas disponibles. Nunca inventes datos ni rutinas de memoria.
     """
 )
 
-# ─────────────────────────────────────────────
 # ENDPOINT
-# ─────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     mensaje: str
