@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_chroma import Chroma
@@ -12,6 +12,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from datetime import datetime
 import json
 import os
+import time
 import requests
 from bs4 import BeautifulSoup
 
@@ -49,13 +50,14 @@ def cargar_log() -> dict:
             return json.loads(contenido)
     return {}
 
-def guardar_log(role: str, content: str):
+def guardar_log(role: str, content: str, tools_usadas: list = []):
     logs = cargar_log()
     if "mensajes" not in logs:
         logs["mensajes"] = []
     logs["mensajes"].append({
         "role": role,
         "content": content,
+        "tools_usadas": tools_usadas,
         "timestamp": datetime.now().isoformat()
     })
     with open(LOGS_FILE, "w", encoding="utf-8") as f:
@@ -80,9 +82,11 @@ def consultar_base_de_conocimiento(consulta: str) -> str:
         return f"Error al consultar la base de conocimiento: {e}"
 
 @tool
-def calcular_imc(peso_kg: float, altura_m: float) -> str:
+def calcular_imc(peso_kg: str, altura_m: str) -> str:
     """Calcula el Índice de Masa Corporal (IMC) dado el peso en Kg y la altura en m."""
     try:
+        peso_kg = float(peso_kg)
+        altura_m = float(altura_m)
         imc = peso_kg / (altura_m ** 2)
         if imc < 18.5:
             categoria = "Bajo peso"
@@ -97,13 +101,16 @@ def calcular_imc(peso_kg: float, altura_m: float) -> str:
         return f"Error al calcular el IMC: {e}"
 
 @tool
-def calcular_calorias(peso_kg: float, altura_m: float, edad: int, sexo: str, nivel_actividad: str) -> str:
+def calcular_calorias(peso_kg: str, altura_m: str, edad: str, sexo: str, nivel_actividad: str) -> str:
     """
     Calcula las calorías diarias recomendadas usando la fórmula de Harris-Benedict.
     Sexo: 'hombre' o 'mujer'.
     Nivel de actividad: 'sedentario', 'ligero', 'moderado', 'activo', 'muy activo'.
     """
     try:
+        peso_kg = float(peso_kg)
+        altura_m = float(altura_m)
+        edad = int(edad)
         if sexo.lower() == 'hombre':
             tmb = 88.362 + (13.397 * peso_kg) + (4.799 * altura_m * 100) - (5.677 * edad)
         elif sexo.lower() == 'mujer':
@@ -124,12 +131,13 @@ def calcular_calorias(peso_kg: float, altura_m: float, edad: int, sexo: str, niv
         return f"Error al calcular las calorías: {e}"
 
 @tool
-def calcular_macros(calorias: float, objetivo: str) -> str:
+def calcular_macros(calorias: str, objetivo: str) -> str:
     """
     Calcula la distribución de macronutrientes según el objetivo.
     Objetivo: 'bajar peso', 'mantener', 'ganar músculo'.
     """
     try:
+        calorias = float(calorias)
         distribuciones = {
             "bajar peso":    {"proteina": 0.40, "carbos": 0.30, "grasas": 0.30},
             "mantener":      {"proteina": 0.30, "carbos": 0.40, "grasas": 0.30},
@@ -149,13 +157,14 @@ def calcular_macros(calorias: float, objetivo: str) -> str:
         return f"Error al calcular los macronutrientes: {e}"
 
 @tool
-def rutina_ejercicio(objetivo: str, dias_disponibles: int) -> str:
+def rutina_ejercicio(objetivo: str, dias_disponibles: str) -> str:
     """
     Devuelve una rutina de ejercicio según el objetivo y los días disponibles por semana.
     Objetivo: 'bajar peso', 'ganar músculo', 'resistencia'.
     Días disponibles: número entre 1 y 6.
     """
     try:
+        dias_disponibles = int(dias_disponibles)
         rutinas = {
             "bajar peso": {
                 3: "Lunes: Cardio + Full Body\nMiércoles: HIIT\nViernes: Cardio + Core",
@@ -184,9 +193,8 @@ def rutina_ejercicio(objetivo: str, dias_disponibles: int) -> str:
     except Exception as e:
         return f"Error al generar la rutina de ejercicio: {e}"
 
-
 @tool
-def consultar_ibero_fitness() -> str:
+def consultar_ibero_fitness(consulta: str = "fitness") -> str:
     """
     Obtiene información actualizada sobre las clases fitness, talleres deportivos
     y gimnasio de la IBERO Puebla desde su sitio web oficial.
@@ -196,19 +204,12 @@ def consultar_ibero_fitness() -> str:
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
-
-        # Eliminar scripts, estilos y nav
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
-
-        # Extraer texto del contenido principal
         main = soup.find("main") or soup.find("body")
         texto = main.get_text(separator="\n", strip=True)
-
-        # Limpiar líneas vacías múltiples
         lineas = [l for l in texto.splitlines() if l.strip()]
-        resultado = "\n".join(lineas[:80])  # primeras 80 líneas relevantes
-
+        resultado = "\n".join(lineas[:80])
         return f"Información del fitness IBERO Puebla:\n\n{resultado}"
     except Exception as e:
         return f"Error al obtener información de la IBERO: {e}"
@@ -218,7 +219,7 @@ tavily = TavilySearchResults(max_results=3)
 # AGENTE
 
 agent = create_agent(
-    model=ChatGroq(model="llama-3.3-70b-versatile"),
+    model=ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct"),
     tools=[consultar_base_de_conocimiento, consultar_ibero_fitness, calcular_imc, calcular_calorias, calcular_macros, rutina_ejercicio, tavily],
     system_prompt="""
     Eres FitBot, un experto en fitness y salud.
@@ -243,9 +244,23 @@ class ChatRequest(BaseModel):
 def chat(request: ChatRequest):
     guardar_log("user", request.mensaje)
 
+    inicio = time.time()
     result = agent.invoke({"messages": [HumanMessage(content=request.mensaje)]})
+    tiempo = round(time.time() - inicio, 2)
+
     respuesta = result["messages"][-1].content
 
-    guardar_log("assistant", respuesta)
+    # Extraer tools usadas de los mensajes
+    tools_usadas = []
+    for msg in result["messages"]:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tools_usadas.append(tc["name"])
 
-    return {"respuesta": respuesta}
+    guardar_log("assistant", respuesta, tools_usadas)
+
+    return {
+        "respuesta": respuesta,
+        "tools_usadas": tools_usadas,
+        "tiempo_segundos": tiempo
+    }

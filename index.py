@@ -20,7 +20,7 @@ splitter = RecursiveCharacterTextSplitter(
 chunks = splitter.split_documents(documents)
 print(f"Divididos en {len(chunks)} chunks")
 
-# Embeddings locales (no requiere API key)
+# Embeddings locales
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 # Guardar en ChromaDB
