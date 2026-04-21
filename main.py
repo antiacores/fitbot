@@ -1,5 +1,5 @@
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
@@ -14,11 +14,14 @@ import json
 import os
 import time
 import requests
+import bcrypt
 from bs4 import BeautifulSoup
 
 load_dotenv()
 
+# ─────────────────────────────────────────────
 # CHROMADB
+# ─────────────────────────────────────────────
 
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vectorstore = Chroma(
@@ -26,7 +29,9 @@ vectorstore = Chroma(
     embedding_function=embeddings
 )
 
+# ─────────────────────────────────────────────
 # FASTAPI
+# ─────────────────────────────────────────────
 
 app = FastAPI()
 
@@ -37,7 +42,108 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MANEJO DE LOGS EN JSON
+# ─────────────────────────────────────────────
+# USUARIOS
+# ─────────────────────────────────────────────
+
+USUARIOS_FILE = "usuarios.json"
+PERFILES_DIR = "perfiles"
+os.makedirs(PERFILES_DIR, exist_ok=True)
+
+def cargar_usuarios() -> dict:
+    if os.path.exists(USUARIOS_FILE):
+        with open(USUARIOS_FILE, "r", encoding="utf-8") as f:
+            contenido = f.read().strip()
+            if contenido:
+                return json.loads(contenido)
+    return {}
+
+def guardar_usuarios(usuarios: dict):
+    with open(USUARIOS_FILE, "w", encoding="utf-8") as f:
+        json.dump(usuarios, f, ensure_ascii=False, indent=2)
+
+def crear_perfil_md(username: str, datos: dict):
+    """Crea el archivo .md del perfil del usuario de forma ordenada."""
+    contenido = f"""# Perfil de {datos['nombre']}
+
+## Datos Básicos
+- **Username**: {username}
+- **Nombre**: {datos['nombre']}
+- **Edad**: {datos['edad']} años
+- **Sexo**: {datos['sexo']}
+- **Peso**: {datos['peso_kg']} kg
+- **Altura**: {datos['altura_m']} m
+- **Nivel de actividad**: {datos['nivel_actividad']}
+- **Objetivo principal**: {datos['objetivo']}
+
+## Preferencias Deportivas
+*(Se actualizará automáticamente con la conversación)*
+
+## Preferencias Alimentarias
+*(Se actualizará automáticamente con la conversación)*
+
+## Preferencias de Ejercicio
+*(Se actualizará automáticamente con la conversación)*
+
+## Historial y Notas
+- Perfil creado el {datetime.now().strftime('%d/%m/%Y')}
+"""
+    path = os.path.join(PERFILES_DIR, f"{username}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(contenido)
+    return path
+
+def indexar_perfil(username: str):
+    """Indexa o re-indexa el perfil del usuario en ChromaDB."""
+    path = os.path.join(PERFILES_DIR, f"{username}.md")
+    with open(path, "r", encoding="utf-8") as f:
+        contenido = f.read()
+
+    # Eliminar documentos anteriores del usuario
+    try:
+        vectorstore._collection.delete(where={"username": username})
+    except Exception:
+        pass
+
+    vectorstore.add_texts(
+        texts=[contenido],
+        metadatas=[{"username": username, "tipo": "perfil"}],
+        ids=[f"perfil_{username}"]
+    )
+
+def actualizar_perfil_md(username: str, seccion: str, nuevo_dato: str):
+    """Agrega información nueva a una sección del perfil."""
+    path = os.path.join(PERFILES_DIR, f"{username}.md")
+    with open(path, "r", encoding="utf-8") as f:
+        contenido = f.read()
+
+    marcador = f"## {seccion}"
+    if marcador in contenido:
+        # Reemplaza el placeholder si existe, si no agrega al final de la sección
+        placeholder = "*(Se actualizará automáticamente con la conversación)*"
+        if placeholder in contenido:
+            contenido = contenido.replace(
+                f"{marcador}\n{placeholder}",
+                f"{marcador}\n- {nuevo_dato}"
+            )
+        else:
+            # Busca la sección y agrega al final antes de la siguiente sección
+            partes = contenido.split(marcador)
+            siguiente = partes[1].find("\n## ")
+            if siguiente != -1:
+                partes[1] = partes[1][:siguiente] + f"\n- {nuevo_dato}" + partes[1][siguiente:]
+            else:
+                partes[1] = partes[1].rstrip() + f"\n- {nuevo_dato}\n"
+            contenido = marcador.join(partes)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(contenido)
+
+    indexar_perfil(username)
+
+# ─────────────────────────────────────────────
+# LOGS
+# ─────────────────────────────────────────────
 
 LOGS_FILE = "fitness_agent_logs.json"
 
@@ -50,11 +156,11 @@ def cargar_log() -> dict:
             return json.loads(contenido)
     return {}
 
-def guardar_log(role: str, content: str, tools_usadas: list = []):
+def guardar_log(username: str, role: str, content: str, tools_usadas: list = []):
     logs = cargar_log()
-    if "mensajes" not in logs:
-        logs["mensajes"] = []
-    logs["mensajes"].append({
+    if username not in logs:
+        logs[username] = []
+    logs[username].append({
         "role": role,
         "content": content,
         "tools_usadas": tools_usadas,
@@ -63,7 +169,9 @@ def guardar_log(role: str, content: str, tools_usadas: list = []):
     with open(LOGS_FILE, "w", encoding="utf-8") as f:
         json.dump(logs, f, ensure_ascii=False, indent=2)
 
+# ─────────────────────────────────────────────
 # HERRAMIENTAS
+# ─────────────────────────────────────────────
 
 @tool
 def consultar_base_de_conocimiento(consulta: str) -> str:
@@ -216,33 +324,142 @@ def consultar_ibero_fitness(consulta: str = "fitness") -> str:
 
 tavily = TavilySearchResults(max_results=3)
 
+# ─────────────────────────────────────────────
 # AGENTE
+# ─────────────────────────────────────────────
 
-agent = create_agent(
-    model=ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct"),
-    tools=[consultar_base_de_conocimiento, consultar_ibero_fitness, calcular_imc, calcular_calorias, calcular_macros, rutina_ejercicio, tavily],
-    system_prompt="""
-    Eres FitBot, un experto en fitness y salud.
-    Usa:
-    - consultar_base_de_conocimiento para responder preguntas sobre ejercicios, nutrición, lesiones, planes de dieta y términos fitness.
-    - calcular_imc para evaluar el estado corporal.
-    - calcular_calorias para determinar necesidades energéticas.
-    - calcular_macros para planificar dietas según objetivos.
-    - rutina_ejercicio para generar rutinas según objetivos y disponibilidad semanal.
-    - consultar_ibero_fitness para obtener información actualizada sobre clases, talleres y gimnasio de la IBERO Puebla.
-    - Tavily para buscar noticias y consejos actualizados de fitness en internet.
+def crear_agente(perfil_usuario: str = ""):
+    system_prompt = f"""
+    Eres FitBot, un experto en fitness y salud personalizado.
+    {"Información del usuario actual:" + perfil_usuario if perfil_usuario else ""}
+    
+    Usa las herramientas disponibles:
+    - consultar_base_de_conocimiento: para preguntas sobre ejercicios, nutrición, lesiones, planes de dieta y términos fitness.
+    - calcular_imc: para evaluar el estado corporal.
+    - calcular_calorias: para determinar necesidades energéticas.
+    - calcular_macros: para planificar dietas según objetivos.
+    - rutina_ejercicio: para generar rutinas según objetivos y disponibilidad semanal.
+    - consultar_ibero_fitness: para información sobre clases, talleres y gimnasio de la IBERO Puebla.
+    - Tavily: para buscar noticias y consejos actualizados de fitness en internet.
+    
     SIEMPRE usa las herramientas disponibles. Nunca inventes datos ni rutinas de memoria.
+    Si conoces el perfil del usuario, úsalo para personalizar tus respuestas sin pedirle datos que ya tienes.
     """
-)
+    return create_agent(
+        model=ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct"),
+        tools=[consultar_base_de_conocimiento, consultar_ibero_fitness, calcular_imc, calcular_calorias, calcular_macros, rutina_ejercicio, tavily],
+        system_prompt=system_prompt
+    )
 
-# ENDPOINT
+def detectar_y_actualizar_perfil(username: str, mensaje: str, respuesta: str):
+    """Usa el LLM para detectar info relevante del usuario y actualizar su perfil."""
+    llm = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct")
+    prompt = f"""Analiza este intercambio de conversación y detecta si el usuario mencionó alguna preferencia o dato personal relevante para fitness.
+
+Mensaje del usuario: "{mensaje}"
+Respuesta del asistente: "{respuesta}"
+
+Si detectas alguna de estas categorías, responde SOLO en este formato JSON (sin markdown):
+{{"seccion": "Preferencias Deportivas" | "Preferencias Alimentarias" | "Preferencias de Ejercicio" | "Historial y Notas", "dato": "el dato específico"}}
+
+Si no hay nada relevante, responde exactamente: null"""
+
+    result = llm.invoke(prompt)
+    texto = result.content.strip()
+
+    if texto == "null" or not texto:
+        return
+
+    try:
+        info = json.loads(texto)
+        if info and "seccion" in info and "dato" in info:
+            actualizar_perfil_md(username, info["seccion"], info["dato"])
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────
+# ENDPOINTS
+# ─────────────────────────────────────────────
+
+class RegistroRequest(BaseModel):
+    username: str
+    password: str
+    nombre: str
+    edad: str
+    sexo: str
+    peso_kg: str
+    altura_m: str
+    nivel_actividad: str
+    objetivo: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 class ChatRequest(BaseModel):
+    username: str
     mensaje: str
+
+@app.post("/registro")
+def registro(request: RegistroRequest):
+    usuarios = cargar_usuarios()
+
+    if request.username in usuarios:
+        raise HTTPException(status_code=400, detail="El username ya existe")
+
+    # Hashear password
+    hashed = bcrypt.hashpw(request.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    usuarios[request.username] = {"password": hashed, "nombre": request.nombre}
+    guardar_usuarios(usuarios)
+
+    # Crear perfil .md
+    datos = {
+        "nombre": request.nombre,
+        "edad": request.edad,
+        "sexo": request.sexo,
+        "peso_kg": request.peso_kg,
+        "altura_m": request.altura_m,
+        "nivel_actividad": request.nivel_actividad,
+        "objetivo": request.objetivo,
+    }
+    crear_perfil_md(request.username, datos)
+    indexar_perfil(request.username)
+
+    return {"mensaje": f"Usuario {request.username} registrado exitosamente"}
+
+@app.post("/login")
+def login(request: LoginRequest):
+    usuarios = cargar_usuarios()
+
+    if request.username not in usuarios:
+        raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
+
+    hashed = usuarios[request.username]["password"].encode("utf-8")
+    if not bcrypt.checkpw(request.password.encode("utf-8"), hashed):
+        raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
+
+    return {"mensaje": "Login exitoso", "username": request.username, "nombre": usuarios[request.username]["nombre"]}
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    guardar_log("user", request.mensaje)
+    guardar_log(request.username, "user", request.mensaje)
+
+    # Buscar perfil del usuario en ChromaDB
+    perfil_usuario = ""
+    try:
+        docs = vectorstore.similarity_search(
+            f"perfil {request.username}",
+            k=1,
+            filter={"username": request.username}
+        )
+        if docs:
+            perfil_usuario = docs[0].page_content
+    except Exception:
+        pass
+
+    # Crear agente con contexto del perfil
+    agent = crear_agente(perfil_usuario)
 
     inicio = time.time()
     result = agent.invoke({"messages": [HumanMessage(content=request.mensaje)]})
@@ -250,14 +467,20 @@ def chat(request: ChatRequest):
 
     respuesta = result["messages"][-1].content
 
-    # Extraer tools usadas de los mensajes
+    # Extraer tools usadas
     tools_usadas = []
     for msg in result["messages"]:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
                 tools_usadas.append(tc["name"])
 
-    guardar_log("assistant", respuesta, tools_usadas)
+    guardar_log(request.username, "assistant", respuesta, tools_usadas)
+
+    # Detectar y guardar info nueva del usuario en segundo plano
+    try:
+        detectar_y_actualizar_perfil(request.username, request.mensaje, respuesta)
+    except Exception:
+        pass
 
     return {
         "respuesta": respuesta,
