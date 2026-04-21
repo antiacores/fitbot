@@ -19,19 +19,11 @@ from bs4 import BeautifulSoup
 
 load_dotenv()
 
-# ─────────────────────────────────────────────
-# CHROMADB
-# ─────────────────────────────────────────────
-
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vectorstore = Chroma(
     persist_directory="./chroma_db",
     embedding_function=embeddings
 )
-
-# ─────────────────────────────────────────────
-# FASTAPI
-# ─────────────────────────────────────────────
 
 app = FastAPI()
 
@@ -41,10 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ─────────────────────────────────────────────
-# USUARIOS
-# ─────────────────────────────────────────────
 
 USUARIOS_FILE = "usuarios.json"
 PERFILES_DIR = "perfiles"
@@ -76,6 +64,12 @@ def crear_perfil_md(username: str, datos: dict):
 - **Nivel de actividad**: {datos['nivel_actividad']}
 - **Objetivo principal**: {datos['objetivo']}
 
+## Condiciones Médicas
+{f"- {datos['condiciones_medicas']}" if datos.get('condiciones_medicas') else "*(Sin condiciones registradas)*"}
+
+## Progreso
+*(Se actualizará automáticamente con la conversación)*
+
 ## Preferencias Deportivas
 *(Se actualizará automáticamente con la conversación)*
 
@@ -99,7 +93,6 @@ def indexar_perfil(username: str):
     with open(path, "r", encoding="utf-8") as f:
         contenido = f.read()
 
-    # Eliminar documentos anteriores del usuario
     try:
         vectorstore._collection.delete(where={"username": username})
     except Exception:
@@ -119,15 +112,13 @@ def actualizar_perfil_md(username: str, seccion: str, nuevo_dato: str):
 
     marcador = f"## {seccion}"
     if marcador in contenido:
-        # Reemplaza el placeholder si existe, si no agrega al final de la sección
         placeholder = "*(Se actualizará automáticamente con la conversación)*"
-        if placeholder in contenido:
+        if f"{marcador}\n{placeholder}" in contenido:
             contenido = contenido.replace(
                 f"{marcador}\n{placeholder}",
                 f"{marcador}\n- {nuevo_dato}"
             )
         else:
-            # Busca la sección y agrega al final antes de la siguiente sección
             partes = contenido.split(marcador)
             siguiente = partes[1].find("\n## ")
             if siguiente != -1:
@@ -141,9 +132,13 @@ def actualizar_perfil_md(username: str, seccion: str, nuevo_dato: str):
 
     indexar_perfil(username)
 
-# ─────────────────────────────────────────────
-# LOGS
-# ─────────────────────────────────────────────
+def actualizar_dato_basico(username: str, dato: str):
+    """Registra un cambio en datos básicos con timestamp en el historial."""
+    actualizar_perfil_md(
+        username,
+        "Historial y Notas",
+        f"{datetime.now().strftime('%d/%m/%Y')}: {dato}"
+    )
 
 LOGS_FILE = "fitness_agent_logs.json"
 
@@ -168,10 +163,6 @@ def guardar_log(username: str, role: str, content: str, tools_usadas: list = [])
     })
     with open(LOGS_FILE, "w", encoding="utf-8") as f:
         json.dump(logs, f, ensure_ascii=False, indent=2)
-
-# ─────────────────────────────────────────────
-# HERRAMIENTAS
-# ─────────────────────────────────────────────
 
 @tool
 def consultar_base_de_conocimiento(consulta: str) -> str:
@@ -324,15 +315,11 @@ def consultar_ibero_fitness(consulta: str = "fitness") -> str:
 
 tavily = TavilySearchResults(max_results=3)
 
-# ─────────────────────────────────────────────
-# AGENTE
-# ─────────────────────────────────────────────
-
 def crear_agente(perfil_usuario: str = ""):
     system_prompt = f"""
     Eres FitBot, un experto en fitness y salud personalizado.
-    {"Información del usuario actual:" + perfil_usuario if perfil_usuario else ""}
-    
+    {"Información del usuario actual: " + perfil_usuario if perfil_usuario else ""}
+
     Usa las herramientas disponibles:
     - consultar_base_de_conocimiento: para preguntas sobre ejercicios, nutrición, lesiones, planes de dieta y términos fitness.
     - calcular_imc: para evaluar el estado corporal.
@@ -341,9 +328,10 @@ def crear_agente(perfil_usuario: str = ""):
     - rutina_ejercicio: para generar rutinas según objetivos y disponibilidad semanal.
     - consultar_ibero_fitness: para información sobre clases, talleres y gimnasio de la IBERO Puebla.
     - Tavily: para buscar noticias y consejos actualizados de fitness en internet.
-    
+
     SIEMPRE usa las herramientas disponibles. Nunca inventes datos ni rutinas de memoria.
     Si conoces el perfil del usuario, úsalo para personalizar tus respuestas sin pedirle datos que ya tienes.
+    Si el usuario tiene condiciones médicas registradas, tenlas siempre en cuenta al dar recomendaciones.
     """
     return create_agent(
         model=ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct"),
@@ -354,32 +342,50 @@ def crear_agente(perfil_usuario: str = ""):
 def detectar_y_actualizar_perfil(username: str, mensaje: str, respuesta: str):
     """Usa el LLM para detectar info relevante del usuario y actualizar su perfil."""
     llm = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct")
-    prompt = f"""Analiza este intercambio de conversación y detecta si el usuario mencionó alguna preferencia o dato personal relevante para fitness.
+    prompt = f"""Analiza este intercambio y detecta si el usuario mencionó información relevante para su perfil fitness. Solo añádelo si no tenías ese dato registrado.
 
 Mensaje del usuario: "{mensaje}"
 Respuesta del asistente: "{respuesta}"
 
-Si detectas alguna de estas categorías, responde SOLO en este formato JSON (sin markdown):
-{{"seccion": "Preferencias Deportivas" | "Preferencias Alimentarias" | "Preferencias de Ejercicio" | "Historial y Notas", "dato": "el dato específico"}}
+Detecta las cosas más relevante de estas categorías:
+- "Progreso": avances, cambios de peso, logros, cómo va con su entrenamiento
+- "Condiciones Médicas": enfermedades, cirugías, lesiones, limitaciones físicas
+- "Preferencias Deportivas": deportes o actividades que le gustan o no
+- "Preferencias Alimentarias": alimentos que le gustan, no le gustan o no puede comer
+- "Preferencias de Ejercicio": ejercicios específicos que prefiere o evita
+- "Datos Básicos": si menciona un cambio en peso, altura o nivel de actividad
 
+Si detectas algo, responde SOLO en JSON sin markdown:
+{{"seccion": "nombre de la sección", "dato": "descripción concisa del dato"}}
+
+Si es un cambio en Datos Básicos como el peso, incluye el nuevo valor en el dato.
 Si no hay nada relevante, responde exactamente: null"""
 
     result = llm.invoke(prompt)
     texto = result.content.strip()
+    print(f"DEBUG perfil update: '{texto}'")
 
     if texto == "null" or not texto:
         return
 
     try:
-        info = json.loads(texto)
-        if info and "seccion" in info and "dato" in info:
-            actualizar_perfil_md(username, info["seccion"], info["dato"])
-    except Exception:
-        pass
-
-# ─────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────
+        texto_limpio = "[" + texto + "]"
+        items = json.loads(texto_limpio)
+        
+        for info in items:
+            if not info:
+                continue
+            if "seccion" in info and "dato" in info:
+                seccion, dato = info["seccion"], info["dato"]
+            else:
+                seccion, dato = next(iter(info.items()))
+            
+            if seccion == "Datos Básicos":
+                actualizar_dato_basico(username, dato)
+            else:
+                actualizar_perfil_md(username, seccion, dato)
+    except Exception as e:
+        print(f"Error parseando perfil: {e}")
 
 class RegistroRequest(BaseModel):
     username: str
@@ -391,6 +397,7 @@ class RegistroRequest(BaseModel):
     altura_m: str
     nivel_actividad: str
     objetivo: str
+    condiciones_medicas: str = ""
 
 class LoginRequest(BaseModel):
     username: str
@@ -407,13 +414,10 @@ def registro(request: RegistroRequest):
     if request.username in usuarios:
         raise HTTPException(status_code=400, detail="El username ya existe")
 
-    # Hashear password
     hashed = bcrypt.hashpw(request.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
     usuarios[request.username] = {"password": hashed, "nombre": request.nombre}
     guardar_usuarios(usuarios)
 
-    # Crear perfil .md
     datos = {
         "nombre": request.nombre,
         "edad": request.edad,
@@ -422,6 +426,7 @@ def registro(request: RegistroRequest):
         "altura_m": request.altura_m,
         "nivel_actividad": request.nivel_actividad,
         "objetivo": request.objetivo,
+        "condiciones_medicas": request.condiciones_medicas,
     }
     crear_perfil_md(request.username, datos)
     indexar_perfil(request.username)
@@ -445,7 +450,6 @@ def login(request: LoginRequest):
 def chat(request: ChatRequest):
     guardar_log(request.username, "user", request.mensaje)
 
-    # Buscar perfil del usuario en ChromaDB
     perfil_usuario = ""
     try:
         docs = vectorstore.similarity_search(
@@ -458,7 +462,6 @@ def chat(request: ChatRequest):
     except Exception:
         pass
 
-    # Crear agente con contexto del perfil
     agent = crear_agente(perfil_usuario)
 
     inicio = time.time()
@@ -467,7 +470,6 @@ def chat(request: ChatRequest):
 
     respuesta = result["messages"][-1].content
 
-    # Extraer tools usadas
     tools_usadas = []
     for msg in result["messages"]:
         if isinstance(msg, AIMessage) and msg.tool_calls:
@@ -476,7 +478,6 @@ def chat(request: ChatRequest):
 
     guardar_log(request.username, "assistant", respuesta, tools_usadas)
 
-    # Detectar y guardar info nueva del usuario en segundo plano
     try:
         detectar_y_actualizar_perfil(request.username, request.mensaje, respuesta)
     except Exception:
